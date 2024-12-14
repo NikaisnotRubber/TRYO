@@ -742,3 +742,76 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+class DEYODetectionLoss(v8DetectionLoss):
+    """Criterion class for computing training losses."""
+    
+    def __init__(self, model, tal_topk=1):
+        super().__init__(model, tal_topk=1)
+        
+    def __call__(self, preds, batch):
+        loss = torch.zeros(1, device=self.device)  # cls
+        feats, pred_scores, topk_ind = preds[1] if isinstance(preds[1], tuple) else preds
+        
+        pred_distri, enc_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        enc_scores = enc_scores.permute(0, 2, 1).contiguous()
+        
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[1]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+        
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+                enc_scores.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                gt_labels,
+                gt_bboxes,
+                mask_gt,
+            )
+        
+        # Cls loss
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss[0] = self.bce(enc_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        
+        loss[0] *= self.hyp.cls  # cls gain
+        
+        for pred_score in pred_scores:
+            bs, nq = pred_score.shape[:2]
+            batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, nq).view(-1)
+            total_scores = torch.zeros((bs, pred_bboxes.shape[1], self.nc), dtype=pred_score.dtype, device=pred_score.device)
+            total_scores[batch_ind, topk_ind] = pred_score.view(bs * nq, -1).sigmoid()
+            
+            
+            _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+                total_scores.detach(),
+                (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                gt_labels,
+                gt_bboxes,
+                mask_gt,
+            )
+            
+            target_scores = target_scores[batch_ind, topk_ind].view(bs, nq, -1)
+            target_scores_sum = max(target_scores.sum(), 1)
+            
+            # Cls loss
+            
+            loss_ = self.bce(pred_score, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+            loss_ *= self.hyp.cls  # cls gain   
+            loss[0] += loss_
+            
+        return loss.sum() * batch_size, loss.detach()  # loss(cls)

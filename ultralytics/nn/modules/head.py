@@ -12,10 +12,10 @@ from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
 from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
 from .conv import Conv, DWConv
-from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
+from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer,ScaleAdaptiveTransformerDecoder,ScaleAdaptiveDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect","DEYODetect"
 
 
 class Detect(nn.Module):
@@ -618,3 +618,96 @@ class v10Detect(Detect):
             for x in ch
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class DEYODetect(Detect):
+    def __init__(
+        self,
+        nc=80,
+        ch=(512, 1024, 2048),
+        nq=300,
+        nh=8,  # num head
+        ndl=2,  # num decoder layers
+        d_ffn=1024,  # dim of feedforward
+        dropout=0.0,
+        act=nn.ReLU(),
+        eval_idx=-1,
+    ):
+        super().__init__(nc, ch)
+        hd=ch[1]
+        c3 = max(ch[0], min(self.nc, 100))  # channels
+        self.cv2.requires_grad = False
+        self.num_queries = nq
+        self.norm = nn.LayerNorm(hd)
+        self.cv3 = nn.ModuleList(nn.Sequential(nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)), \
+                                               nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)), \
+                                                nn.Conv2d(c3, self.nc, 1)) for i, x in enumerate(ch))
+        self.input_proj = nn.ModuleList(nn.Linear(x, hd) for x in ch)
+        decoder_layer = ScaleAdaptiveDecoderLayer(hd, nh, d_ffn, dropout, act)
+        self.decoder = ScaleAdaptiveTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
+        self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        self._reset_parameters()
+        
+    def get_encoder_input(self, x):
+        """Processes and returns encoder inputs by getting projection features from input and concatenating them."""
+        feats = [feat.flatten(2).permute(0, 2, 1) for feat in x]
+        for i, feat in enumerate(feats):
+            feats[i] = self.input_proj[i](feat)
+        feats = torch.cat(feats, 1)
+        return feats
+    
+    def generate_anchors(self, x):
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+        return x, dbox, cls
+        
+    def get_decoder_output(self, feats, dbox, cls, imgsz):
+        dbox = dbox.permute(0, 2, 1).contiguous().detach()
+        cls = cls.permute(0, 2, 1).contiguous()
+        
+        bs = feats.shape[0]
+        topk_ind = torch.topk(cls.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+        embed = feats[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        embed = self.norm(embed)
+        
+        dec_bboxes = dbox[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        refer_bbox = dec_bboxes / torch.tensor(imgsz, device=dbox.device)[[1, 0, 1, 0]]
+        
+        dec_scores = self.decoder(
+            embed,
+            refer_bbox,
+            self.dec_score_head,
+            self.query_pos_head,
+        )
+        return dec_bboxes, dec_scores, topk_ind
+    
+    def forward(self, x, imgsz=None):
+        if self.stride[0] == 0:
+            return super().forward(x)
+        feats = self.get_encoder_input(x)
+        preds, dbox, cls = self.generate_anchors(x)
+        dec_bboxes, dec_scores, topk_ind = self.get_decoder_output(feats, dbox, cls, imgsz)
+        x = preds, dec_scores, topk_ind
+        if self.training:
+            return x
+        y = torch.cat((dec_bboxes, dec_scores.squeeze(0).sigmoid()), -1)
+        return y if self.export else (y, x)
+        
+    def _reset_parameters(self):
+        """Initializes or resets the parameters of the model's various components with predefined weights and biases."""
+        bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+        for cls_ in self.dec_score_head:
+            constant_(cls_.bias, bias_cls)
+        xavier_uniform_(self.query_pos_head.layers[0].weight)
+        xavier_uniform_(self.query_pos_head.layers[1].weight)
+        for layer in self.input_proj:
+            xavier_uniform_(layer.weight)

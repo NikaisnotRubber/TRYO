@@ -22,6 +22,8 @@ __all__ = (
     "DeformableTransformerDecoderLayer",
     "MSDeformAttn",
     "MLP",
+    "ScaleAdaptiveTransformerDecoder",
+    "ScaleAdaptiveDecoderLayer",
 )
 
 
@@ -425,3 +427,113 @@ class DeformableTransformerDecoder(nn.Module):
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)
+
+class ScaleAdaptiveTransformerDecoder(nn.Module):
+    
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+        """Initialize the DeformableTransformerDecoder with the given parameters."""
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+        
+    @torch.no_grad()
+    def calc_bbox_dists(self, bboxes):
+        centers = bboxes[..., :2]
+        dist = []
+        for b in range(centers.shape[0]):
+            dist_b = torch.norm(centers[b].reshape(-1, 1, 2) - centers[b].reshape(1, -1, 2), dim=-1)
+            dist.append(dist_b[None, ...])
+            
+        dist = torch.cat(dist, dim=0)  # [B, Q, Q]
+        dist = -dist
+        
+        return dist
+    
+    def forward(
+        self,
+        embed,  # decoder embeddings
+        refer_bbox,  # anchor
+        score_head,
+        pos_mlp,
+        attn_mask=None,
+        padding_mask=None,
+    ):
+        """Perform the forward pass through the entire decoder."""
+        output = embed
+        dec_bboxes = []
+        dec_cls = []
+        last_refined_bbox = None
+        pos = pos_mlp(refer_bbox)
+        dist = self.calc_bbox_dists(refer_bbox)
+        for i, layer in enumerate(self.layers):
+            output = layer(output, refer_bbox, dist, padding_mask, attn_mask, pos)
+            
+            if self.training:
+                dec_cls.append(score_head[i](output))
+            elif i == self.eval_idx:
+                dec_cls.append(score_head[i](output))
+                break
+            
+        return torch.stack(dec_cls)
+    
+class ScaleAdaptiveDecoderLayer(nn.Module):
+    
+    def __init__(self, d_model=256, n_heads=8, d_ffn=1024, dropout=0.0, act=nn.ReLU()):
+        """Initialize the DeformableTransformerDecoderLayer with the given parameters."""
+        super().__init__()
+        
+        # Self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.gen_tau = nn.Linear(d_model, n_heads)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.act = act
+        self.dropout2 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.init_weights()
+        
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        """Add positional embeddings to the input tensor, if provided."""
+        return tensor if pos is None else tensor + pos
+    
+    @torch.no_grad()
+    def init_weights(self):
+        nn.init.zeros_(self.gen_tau.weight)
+        nn.init.uniform_(self.gen_tau.bias, 0.0, 2.0)
+        
+    def forward_ffn(self, tgt):
+        """Perform forward pass through the Feed-Forward Network part of the layer."""
+        tgt2 = self.linear2(self.dropout2(self.act(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        return self.norm2(tgt)
+    
+    def forward(self, embed, refer_bbox, dist, padding_mask=None, attn_mask=None, query_pos=None):
+        """Perform the forward pass through the entire decoder layer."""
+        
+        # Self attention
+        tau = self.gen_tau(embed)  # [B, Q, 8]
+        tau = tau.permute(0, 2, 1)  # [B, 8, Q]
+        dist_attn_mask = dist[:, None, :, :] * tau[..., None]  # [B, 8, Q, Q]
+        if attn_mask is not None:
+            dist_attn_mask[:, :, attn_mask] = float('-inf')
+        attn_mask = dist_attn_mask.flatten(0, 1) # [Bx8, Q, Q]
+        q = k = self.with_pos_embed(embed, query_pos)
+        tgt = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), embed.transpose(0, 1), attn_mask=attn_mask)[
+            0
+        ].transpose(0, 1)
+        embed = embed + self.dropout1(tgt)
+        embed = self.norm1(embed)
+        
+        # FFN
+        return self.forward_ffn(embed)
+    
