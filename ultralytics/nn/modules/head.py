@@ -352,7 +352,6 @@ class WorldDetect(Detect):
             a[-1].bias.data[:] = 1.0  # box
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
-
 class RTDETRDecoder(nn.Module):
     """
     Real-Time Deformable Transformer Decoder (RTDETRDecoder) module for object detection.
@@ -462,19 +461,10 @@ class RTDETRDecoder(nn.Module):
             self.training,
         )
 
-        embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
+        dec_bboxes, dec_scores, enc_bboxes, enc_scores = self._get_decoder_output(feats, shapes, dn_embed, dn_bbox, attn_mask)
 
         # Decoder
-        dec_bboxes, dec_scores = self.decoder(
-            embed,
-            refer_bbox,
-            feats,
-            shapes,
-            self.dec_bbox_head,
-            self.dec_score_head,
-            self.query_pos_head,
-            attn_mask=attn_mask,
-        )
+        
         x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return x
@@ -520,13 +510,13 @@ class RTDETRDecoder(nn.Module):
         feats = torch.cat(feats, 1)
         return feats, shapes
 
-    def _get_decoder_input(self, feats, shapes, dn_embed=None, dn_bbox=None):
+    def _get_decoder_output(self, feats, shapes, dn_embed=None, dn_bbox=None, attn_mask=None):
         """Generates and prepares the input required for the decoder from the provided features and shapes."""
         bs = feats.shape[0]
         # Prepare input for decoder
         anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
         features = self.enc_output(valid_mask * feats)  # bs, h*w, 256
-
+        
         enc_outputs_scores = self.enc_score_head(features)  # (bs, h*w, nc)
 
         # Query selection
@@ -555,8 +545,18 @@ class RTDETRDecoder(nn.Module):
                 embeddings = embeddings.detach()
         if dn_embed is not None:
             embeddings = torch.cat([dn_embed, embeddings], 1)
-
-        return embeddings, refer_bbox, enc_bboxes, enc_scores
+    
+        dec_bboxes, dec_scores = self.decoder(
+                embeddings,
+                refer_bbox,
+                feats,
+                shapes,
+                self.dec_bbox_head,
+                self.dec_score_head,
+                self.query_pos_head,
+                attn_mask=attn_mask,
+            )
+        return dec_bboxes, dec_scores, enc_bboxes, enc_scores
 
     # TODO
     def _reset_parameters(self):
@@ -582,7 +582,6 @@ class RTDETRDecoder(nn.Module):
         xavier_uniform_(self.query_pos_head.layers[1].weight)
         for layer in self.input_proj:
             xavier_uniform_(layer[0].weight)
-
 
 class v10Detect(Detect):
     """
@@ -619,13 +618,13 @@ class v10Detect(Detect):
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
 
-
 class DEYODetect(Detect):
     def __init__(
         self,
         nc=80,
         ch=(512, 1024, 2048),
         nq=300,
+        ndp=4,
         nh=8,  # num head
         ndl=2,  # num decoder layers
         d_ffn=1024,  # dim of feedforward
@@ -643,20 +642,33 @@ class DEYODetect(Detect):
                                                nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)), \
                                                 nn.Conv2d(c3, self.nc, 1)) for i, x in enumerate(ch))
         self.input_proj = nn.ModuleList(nn.Linear(x, hd) for x in ch)
-        decoder_layer = ScaleAdaptiveDecoderLayer(hd, nh, d_ffn, dropout, act)
-        self.decoder = ScaleAdaptiveTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        #decoder_layer = ScaleAdaptiveDecoderLayer(hd, nh, d_ffn, dropout, act)
+        #self.decoder = ScaleAdaptiveTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp)
+        self.decoder = DeformableTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
         self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
         self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        #dec_head
+        self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 4, num_layers=3) for _ in range(ndl)])
         self._reset_parameters()
         
     def get_encoder_input(self, x):
         """Processes and returns encoder inputs by getting projection features from input and concatenating them."""
-        feats = [feat.flatten(2).permute(0, 2, 1) for feat in x]
-        for i, feat in enumerate(feats):
-            feats[i] = self.input_proj[i](feat)
+        feats = []
+        shapes = []
+        for i, feat in enumerate(x):
+            h, w = feat.shape[2:]
+            # [b, c, h, w] -> [b, h*w, c]
+            feat = feat.flatten(2).permute(0, 2, 1)
+            # Apply projection
+            feat = self.input_proj[i](feat)
+            feats.append(feat)
+            shapes.append([h, w])
+        # [b, h*w, c] 
         feats = torch.cat(feats, 1)
-        return feats
-    
+        return feats, shapes
+
     def generate_anchors(self, x):
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
@@ -669,7 +681,7 @@ class DEYODetect(Detect):
         dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
         return x, dbox, cls
         
-    def get_decoder_output(self, feats, dbox, cls, imgsz):
+    def get_decoder_output(self, feats, shapes, dbox, cls, imgsz):
         dbox = dbox.permute(0, 2, 1).contiguous().detach()
         cls = cls.permute(0, 2, 1).contiguous()
         
@@ -682,9 +694,12 @@ class DEYODetect(Detect):
         dec_bboxes = dbox[batch_ind, topk_ind].view(bs, self.num_queries, -1)
         refer_bbox = dec_bboxes / torch.tensor(imgsz, device=dbox.device)[[1, 0, 1, 0]]
         
-        dec_scores = self.decoder(
+        _, dec_scores = self.decoder(
             embed,
             refer_bbox,
+            feats,
+            shapes,
+            self.dec_bbox_head,
             self.dec_score_head,
             self.query_pos_head,
         )
@@ -693,13 +708,179 @@ class DEYODetect(Detect):
     def forward(self, x, imgsz=None):
         if self.stride[0] == 0:
             return super().forward(x)
-        feats = self.get_encoder_input(x)
+        feats, shapes = self.get_encoder_input(x)
         preds, dbox, cls = self.generate_anchors(x)
-        dec_bboxes, dec_scores, topk_ind = self.get_decoder_output(feats, dbox, cls, imgsz)
+        dec_bboxes, dec_scores, topk_ind = self.get_decoder_output(feats, shapes, dbox, cls, imgsz)
         x = preds, dec_scores, topk_ind
+        
         if self.training:
             return x
         y = torch.cat((dec_bboxes, dec_scores.squeeze(0).sigmoid()), -1)
+        return y if self.export else (y, x)
+        
+    def _reset_parameters(self):
+        """Initializes or resets the parameters of the model's various components with predefined weights and biases."""
+        bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+        for cls_ in self.dec_score_head:
+            constant_(cls_.bias, bias_cls)
+        xavier_uniform_(self.query_pos_head.layers[0].weight)
+        xavier_uniform_(self.query_pos_head.layers[1].weight)
+        for layer in self.input_proj:
+            xavier_uniform_(layer.weight)
+
+class TRYODetect(Detect):
+    def __init__(
+        self,
+        nc=80,
+        ch=(512, 1024, 2048),
+        nq=300,
+        nh=8,  # num head
+        ndl=3,  # num decoder layers
+        ndp=4,
+        d_ffn=1024,  # dim of feedforward
+        dropout=0.0,
+        act=nn.ReLU(),
+        eval_idx=-1,
+        #new dn
+        nd=100, 
+        label_noise_ratio=0.5,
+        box_noise_scale=1.0,
+        learnt_init_query=False,
+    ):
+        super().__init__(nc, ch)
+        hd=ch[1]
+        c3 = max(ch[0], min(self.nc, 100))  # channels
+        self.cv2.requires_grad = False
+        self.num_queries = nq
+        self.norm = nn.LayerNorm(hd)
+        self.cv3 = nn.ModuleList(nn.Sequential(nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)), \
+                                               nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)), \
+                                                nn.Conv2d(c3, self.nc, 1)) for i, x in enumerate(ch))
+        self.input_proj = nn.ModuleList(nn.Linear(x, hd) for x in ch)
+        #decoder_layer = ScaleAdaptiveDecoderLayer(hd, nh, d_ffn, dropout, act)
+        #self.decoder = ScaleAdaptiveTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp)
+        self.decoder = DeformableTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+        
+        #self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
+        #self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        
+        #new dn part
+        # Denoising part
+        self.denoising_class_embed = nn.Embedding(nc, hd)
+        self.num_denoising = nd
+        self.label_noise_ratio = label_noise_ratio
+        self.box_noise_scale = box_noise_scale
+
+        # Decoder embedding
+        self.learnt_init_query = learnt_init_query
+        if learnt_init_query:
+            self.tgt_embed = nn.Embedding(nq, hd)
+        self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
+
+        # Encoder head
+        self.enc_output = nn.Sequential(nn.Linear(hd, hd), nn.LayerNorm(hd))
+        self.enc_score_head = nn.Linear(hd, nc)
+        self.enc_bbox_head = MLP(hd, hd, 4, num_layers=3)
+
+        # Decoder head
+        self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 4, num_layers=3) for _ in range(ndl)])
+        self._reset_parameters()
+    def get_encoder_input(self, x):
+        """Processes and returns encoder inputs by getting projection features from input and concatenating them."""
+        feats = []
+        shapes = []
+        for i, feat in enumerate(x):
+            h, w = feat.shape[2:]
+            # [b, c, h, w] -> [b, h*w, c]
+            feat = feat.flatten(2).permute(0, 2, 1)
+            # Apply projection
+            feat = self.input_proj[i](feat)
+            feats.append(feat)
+            shapes.append([h, w])
+        # [b, h*w, c] 
+        feats = torch.cat(feats, 1)
+        return feats, shapes
+
+    def generate_anchors(self, x):
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+        return x, dbox, cls
+        
+    def get_decoder_output(self, feats, shapes, dbox, cls, imgsz, attn_mask):
+        dbox = dbox.permute(0, 2, 1).contiguous().detach()
+        cls = cls.permute(0, 2, 1).contiguous()
+        
+        bs = feats.shape[0]
+        ####new
+        # Prepare input for decoder
+        anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+        features = self.enc_output(valid_mask * feats)  # bs, h*w, 256
+
+        enc_outputs_scores = self.enc_score_head(features)  # (bs, h*w, nc)
+
+        topk_ind = torch.topk(cls.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+        embed = feats[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        embed = self.norm(embed)
+        
+        #dec_bboxes = dbox[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        
+        dec_bboxes, dec_scores = self.decoder(
+            embed,
+            refer_bbox,
+            feats,
+            shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attn_mask=attn_mask,
+        )
+        
+        refer_bbox = dec_bboxes / torch.tensor(imgsz, device=dbox.device)[[1, 0, 1, 0]]
+        ####
+        enc_bboxes = refer_bbox.sigmoid()
+        if dn_bbox is not None: 
+            refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
+        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        
+        
+        return dec_bboxes, dec_scores, enc_bboxes, enc_scores
+    
+    def forward(self, x, imgsz=None, batch=None):
+        if self.stride[0] == 0:
+            return super().forward(x)
+        #new
+        from ultralytics.models.utils.ops import get_cdn_group
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+
+        feats, shapes = self.get_encoder_input(x)
+        preds, dbox, cls = self.generate_anchors(x)
+        
+        dec_bboxes, dec_scores, topk_ind = self.get_decoder_output(feats, dbox, cls, imgsz, shapes, attn_mask)
+        
+        x = dec_bboxes, dec_scores, dbox, topk_ind, dn_meta
+        
+        if self.training:
+            return x
+        y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
         return y if self.export else (y, x)
         
     def _reset_parameters(self):

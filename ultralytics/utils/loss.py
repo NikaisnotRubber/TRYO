@@ -750,7 +750,7 @@ class DEYODetectionLoss(v8DetectionLoss):
         super().__init__(model, tal_topk=1)
         
     def __call__(self, preds, batch):
-        loss = torch.zeros(1, device=self.device)  # cls
+        loss = torch.zeros(3, device=self.device)  # cls
         feats, pred_scores, topk_ind = preds[1] if isinstance(preds[1], tuple) else preds
         
         pred_distri, enc_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -785,10 +785,17 @@ class DEYODetectionLoss(v8DetectionLoss):
         
         # Cls loss
         target_scores_sum = max(target_scores.sum(), 1)
-        loss[0] = self.bce(enc_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-        
-        loss[0] *= self.hyp.cls  # cls gain
-        
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+        loss[0] *= self.hyp.box
+        loss[1] = self.bce(enc_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
         for pred_score in pred_scores:
             bs, nq = pred_score.shape[:2]
             batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, nq).view(-1)
